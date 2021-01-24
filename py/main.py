@@ -1,7 +1,12 @@
-from concurrent.futures import ThreadPoolExecutor
-import os
+import torch
 
-import numpy as np
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def int32toUint32(x):
+    if x < 0:
+        x += 2**32
+    return x
 
 
 class GlibcRand:
@@ -10,7 +15,7 @@ class GlibcRand:
 
     def srand(self, seed):
         assert len(seed.shape) == 1
-        self.rand_table = np.array(
+        self.rand_table = torch.tensor(
             (-1726662223, 379960547, 1735697613, 1040273694, 1313901226,
              1627687941, -179304937, -2073333483, 1780058412, -1989503057,
              -615974602, 344556628, 939512070, -1249116260, 1507946756,
@@ -18,8 +23,8 @@ class GlibcRand:
              -1009028674, 968117788, -123449607, 1284210865, 435012392,
              -2017506339, -911064859, -370259173, 1132637927, 1398500161,
              -205601318),
-            dtype=np.int32)
-        self.rand_table = np.tile(self.rand_table, (len(seed), 1))
+            dtype=torch.int32,
+            device=device).repeat((len(seed), 1))
         self.fptr = GlibcRand.SEP_3
         self.rptr = 0
 
@@ -42,8 +47,8 @@ class GlibcRand:
 
     def rand(self):
         self.rand_table[:, self.fptr] += self.rand_table[:, self.rptr]
-        result = (self.rand_table[:, self.fptr].view(np.uint32) >> 1).view(
-            np.int32)
+        result = (
+            self.rand_table[:, self.fptr] >> 1) & 0x7fffffff  # logical shift
         self.fptr += 1
 
         if self.fptr >= GlibcRand.DEG_3:
@@ -60,28 +65,41 @@ class GlibcRand:
 class Encoder:
     def __init__(self, s, batch_size):
         self.batch_size = batch_size
-        self.target = np.array([ord(i) for i in s], dtype=np.int32) - ord('a')
-        self.target = self.target[:, np.newaxis]
-        self.limits = np.iinfo(np.int32)
+        self.target = torch.tensor(
+            [ord(i) for i in s], dtype=torch.int32, device=device) - ord('a')
+        self.target.unsqueeze_(1)
+        self.limits = torch.iinfo(torch.int32)
 
     def run_job(self, start):
         rand = GlibcRand()
-        seed = np.arange(start,
-                         min(self.limits.max + 1, start + self.batch_size))
+        seed = torch.arange(start,
+                            min(self.limits.max + 1, start + self.batch_size))
         rand.srand(seed)
-        results = np.empty((len(self.target), len(seed)), dtype=np.int32)
+        results = torch.empty((len(self.target), len(seed)),
+                              dtype=torch.int32,
+                              device=device)
         for row in results:
             row[:] = rand.rand()
-        successful = seed[np.all(np.equal(results % 26, self.target), axis=0)]
+        successful = seed[torch.eq(results % 26, self.target).all(dim=0)]
         for i in successful:
-            print("Found seed:", np.uint32(i))
+            print("Found seed:", int32toUint32(i.item()))
 
     def run_all(self):
-        cpu_count = len(os.sched_getaffinity(0))
-        print(f"Using {cpu_count} worker threads")
-        with ThreadPoolExecutor() as e:
-            e.map(self.run_job,
-                  range(self.limits.min, self.limits.max, self.batch_size))
+        starts = range(self.limits.min, self.limits.max, self.batch_size)
+        if device.type == "cpu":
+            from concurrent.futures import ThreadPoolExecutor
+            import os
+
+            cpu_count = len(os.sched_getaffinity(0))
+            print(f"Using {cpu_count} worker threads")
+            with ThreadPoolExecutor() as e:
+                e.map(self.run_job, starts)
+        else:
+            from tqdm import tqdm
+
+            print("Using alternate compute source")
+            for start in tqdm(starts):
+                self.run_job(start)
 
 
 if __name__ == "__main__":
